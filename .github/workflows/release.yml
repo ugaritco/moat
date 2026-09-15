@@ -1,0 +1,220 @@
+name: Release
+
+permissions:
+  contents: read
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            ext: .exe
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Sync Cargo.toml version with tag
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i.bak -E "s/^version = \"[^\"]*\"/version = \"${VERSION}\"/" Cargo.toml
+          rm Cargo.toml.bak
+          cargo update -p moat
+
+      - name: Install cross (linux aarch64)
+        if: matrix.cross
+        run: cargo install cross --locked
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          BIN="moat${{ matrix.ext }}"
+          DIR="moat-${VERSION}-${{ matrix.target }}"
+          mkdir "$DIR"
+          cp "target/${{ matrix.target }}/release/$BIN" "$DIR/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "${DIR}.zip" "$DIR"
+            echo "ASSET=${DIR}.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "${DIR}.tar.gz" "$DIR"
+            echo "ASSET=${DIR}.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Generate build provenance attestation
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: ${{ env.ASSET }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          shasum -a 256 * > SHA256SUMS
+
+      - name: Attest checksum file
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-path: dist/SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+
+  update-homebrew-tap:
+    name: Update Homebrew formula
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Download SHA256SUMS
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          curl -fsSL -o SHA256SUMS \
+            "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/SHA256SUMS"
+
+      - name: Update formula
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sha() { grep "moat-${VERSION}-$1\.tar\.gz\$" SHA256SUMS | awk '{print $1}'; }
+          MAC_ARM=$(sha aarch64-apple-darwin)
+          LINUX_ARM=$(sha aarch64-unknown-linux-gnu)
+          LINUX_X86=$(sha x86_64-unknown-linux-gnu)
+
+          for v in MAC_ARM LINUX_ARM LINUX_X86; do
+            if [ -z "${!v}" ]; then
+              echo "Missing sha256 for $v" >&2
+              exit 1
+            fi
+          done
+
+          mkdir -p Formula
+          cat > Formula/moat.rb <<EOF
+          # This repo doubles as a Homebrew tap. Users install with:
+          #   brew install ugarit/moat/moat
+          #
+          # This file is updated automatically by the release workflow.
+
+          class Moat < Formula
+            desc "security posture auditing for your github organization & repositories"
+            homepage "https://github.com/ugarit/moat"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/ugarit/moat/releases/download/v#{version}/moat-#{version}-aarch64-apple-darwin.tar.gz"
+                sha256 "${MAC_ARM}"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/ugarit/moat/releases/download/v#{version}/moat-#{version}-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${LINUX_ARM}"
+              end
+              on_intel do
+                url "https://github.com/ugarit/moat/releases/download/v#{version}/moat-#{version}-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${LINUX_X86}"
+              end
+            end
+
+            def install
+              bin.install "moat"
+            end
+
+            test do
+              assert_match "moat", shell_output("#{bin}/moat --help")
+            end
+          end
+          EOF
+
+      - name: Commit formula via Contents API (signed)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH="${{ github.event.repository.default_branch }}"
+          VERSION="${GITHUB_REF_NAME}"
+
+          # Fetch current file SHA on the branch (required for an update).
+          CURRENT_SHA=$(gh api \
+            "repos/${{ github.repository }}/contents/Formula/moat.rb?ref=${BRANCH}" \
+            --jq .sha 2>/dev/null || true)
+
+          CONTENT_B64=$(base64 -w0 < Formula/moat.rb)
+
+          ARGS=(
+            -X PUT
+            "repos/${{ github.repository }}/contents/Formula/moat.rb"
+            -f "message=chore: bump moat to ${VERSION} [skip ci]"
+            -f "content=${CONTENT_B64}"
+            -f "branch=${BRANCH}"
+          )
+          if [ -n "$CURRENT_SHA" ]; then
+            ARGS+=(-f "sha=${CURRENT_SHA}")
+          fi
+
+          gh api "${ARGS[@]}"
